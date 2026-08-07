@@ -98,9 +98,9 @@ class LoginPage(QWidget):
         self.web.setUrl(QUrl(url))
 
     def _on_url_changed(self, url: QUrl) -> None:
-        # 登录跳转后重新给页面初始化时间，避免立刻误刷
+        # 登录跳转只重置计时；不要当成「正在刷新」，否则会干扰扫码
         if self.watcher:
-            self.watcher.notify_reload_started()
+            self.watcher.notify_navigation()
 
     def _on_load_finished(self, ok: bool) -> None:
         if self.watcher:

@@ -14,8 +14,19 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 
+from app.paths import resource
 
-JS_PATH = Path(__file__).with_name('qq_api.js')
+
+def _load_api_js() -> str:
+    candidates = [
+        Path(__file__).with_name('qq_api.js'),
+        resource('app', 'core', 'qq_api.js'),
+        resource('qq_api.js'),
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path.read_text(encoding='utf-8')
+    raise FileNotFoundError('找不到 qq_api.js，请确认已随程序打包')
 
 
 class QQBridge(QObject):
@@ -26,7 +37,7 @@ class QQBridge(QObject):
     def __init__(self, page: QWebEnginePage, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.page = page
-        self._api_js = JS_PATH.read_text(encoding='utf-8')
+        self._api_js = _load_api_js()
         self._injected = False
 
     def inject_api(self, callback: Callable[[bool], None] | None = None) -> None:
@@ -66,6 +77,64 @@ class QQBridge(QObject):
 
         def after_inject(_=None) -> None:
             self._run_js(expr, lambda ready: callback(bool(ready)))
+
+        self.inject_api(after_inject)
+
+    def check_login_state(self, callback: Callable[[dict], None]) -> None:
+        """返回 ready / 是否允许自动刷新（扫码登录页绝不刷新）。"""
+        expr = r"""
+        (function(){
+          try {
+            var href = String(location.href || '');
+            var cookie = String(document.cookie || '');
+            var onAlbum = /h5\.qzone\.qq\.com\/groupphoto/i.test(href)
+              || /qzone\.qq\.com\/groupphoto/i.test(href);
+            var onLoginHost = /ptlogin2?\.qq\.com|passport\.qq\.com|ssl\.ptlogin/i.test(href);
+            var hasQr = false;
+            try {
+              hasQr = !!(
+                document.querySelector(
+                  'iframe[src*="ptlogin"], iframe[src*="passport"],'
+                  + '#qrlogin_step1, #qr_code, #qrlogin_img, img[src*="ptqrshow"]'
+                )
+              );
+            } catch (e) {}
+            var hasLoginCookie = /(?:^|;\s*)(uin|p_uin|skey|p_skey)=/i.test(cookie);
+            var hasGroupZone = !!(window.GroupZone && GroupZone.GPHOTO);
+            var ready = !!(window.__QQAlbumAPI && window.__QQAlbumAPI.isReady
+              && window.__QQAlbumAPI.isReady());
+            // 仅：已在群相册页、不像扫码登录页、且已有登录痕迹或相册壳，才允许自动刷新
+            var allowAutoRefresh = !!(
+              onAlbum && !onLoginHost && !hasQr && (hasLoginCookie || hasGroupZone) && !ready
+            );
+            return JSON.stringify({
+              ready: ready,
+              allowAutoRefresh: allowAutoRefresh,
+              onAlbum: onAlbum,
+              onLoginHost: onLoginHost,
+              hasQr: hasQr,
+              hasLoginCookie: hasLoginCookie
+            });
+          } catch (e) {
+            return JSON.stringify({ready:false, allowAutoRefresh:false, error:String(e)});
+          }
+        })()
+        """
+
+        def after_inject(_=None) -> None:
+            def parse(raw: Any) -> None:
+                if isinstance(raw, dict):
+                    callback(raw)
+                    return
+                if not raw:
+                    callback({'ready': False, 'allowAutoRefresh': False})
+                    return
+                try:
+                    callback(json.loads(raw))
+                except Exception:
+                    callback({'ready': False, 'allowAutoRefresh': False})
+
+            self._run_js(expr, parse)
 
         self.inject_api(after_inject)
 
@@ -212,7 +281,7 @@ class QQBridge(QObject):
 
 
 class LoginWatcher(QObject):
-    """轮询检测登录就绪；若页面已打开但 API 长期不可用则请求自动刷新。"""
+    """轮询检测登录就绪；仅在已登录进群相册但接口异常时自动刷新。"""
 
     ready_changed = Signal(bool)
     status = Signal(str)
@@ -228,7 +297,7 @@ class LoginWatcher(QObject):
         self._not_ready_ticks = 0
         self._auto_refresh_count = 0
         self._max_auto_refresh = 3
-        # 加载后约 6 秒仍未就绪才自动刷新，避免登录过程中误刷
+        # 已登录进相册后约 6 秒仍未就绪才自动刷新
         self._refresh_after_ticks = 4
         self._refreshing = False
 
@@ -249,14 +318,20 @@ class LoginWatcher(QObject):
         self._refreshing = False
 
     def notify_reload_started(self) -> None:
-        """页面开始刷新时调用，暂停计数避免连环刷新。"""
+        """主动 reload 时调用，暂停计数避免连环刷新。"""
         self._refreshing = True
         self._not_ready_ticks = 0
 
-    def _tick(self) -> None:
-        self.bridge.check_ready(self._on_ready)
+    def notify_navigation(self) -> None:
+        """普通 URL 跳转（含登录页）：只重置计数，不进入刷新锁定。"""
+        self._not_ready_ticks = 0
+        self._refreshing = False
 
-    def _on_ready(self, ready: bool) -> None:
+    def _tick(self) -> None:
+        self.bridge.check_login_state(self._on_state)
+
+    def _on_state(self, state: dict) -> None:
+        ready = bool(state.get('ready'))
         if ready:
             self._not_ready_ticks = 0
             self._refreshing = False
@@ -274,6 +349,20 @@ class LoginWatcher(QObject):
             self.status.emit('正在刷新页面，等待相册接口就绪…')
             return
 
+        # 扫码 / 登录页：只等待，绝不自动刷新
+        if state.get('onLoginHost') or state.get('hasQr'):
+            self._not_ready_ticks = 0
+            self.status.emit('请扫码或账号密码登录（登录完成前不会自动刷新）')
+            return
+
+        if not state.get('allowAutoRefresh'):
+            self._not_ready_ticks = 0
+            if not state.get('hasLoginCookie'):
+                self.status.emit('等待登录…')
+            else:
+                self.status.emit('等待登录或页面就绪…')
+            return
+
         self._not_ready_ticks += 1
         if (
             self._not_ready_ticks >= self._refresh_after_ticks
@@ -283,12 +372,12 @@ class LoginWatcher(QObject):
             self._not_ready_ticks = 0
             self._refreshing = True
             self.status.emit(
-                f'页面状态未就绪，正在自动刷新（{self._auto_refresh_count}/{self._max_auto_refresh}）…'
+                f'已登录但相册接口未就绪，正在自动刷新（{self._auto_refresh_count}/{self._max_auto_refresh}）…'
             )
             self.need_refresh.emit()
             return
 
         if self._auto_refresh_count >= self._max_auto_refresh:
-            self.status.emit('仍未就绪，请手动点「刷新页面」或确认已登录')
+            self.status.emit('仍未就绪，请手动点「刷新页面」')
         else:
-            self.status.emit('等待登录或页面就绪…')
+            self.status.emit('已登录，等待相册接口就绪…')

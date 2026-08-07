@@ -40,17 +40,29 @@ python -m app.main
    `{保存目录}/.qq_album_task/{群号}/state.json`  
    下次用相同目录继续即可跳过已完成项
 
-## 打包（可选）
+## 打包成 exe（推荐）
+
+在项目根目录双击 **`打包.bat`**，或手动执行：
 
 ```bash
-pip install pyinstaller
-pyinstaller -F -w -n QQ群相册下载 ^
-  --collect-all PySide6 ^
-  --hidden-import PySide6.QtWebEngineWidgets ^
-  app/main.py
+pip install -r app/requirements-app.txt pyinstaller
+pyinstaller --noconfirm --clean QQAlbumDownloader.spec
 ```
 
-生成的可执行文件在 `dist/`。首次打包体积较大（含 Chromium）。
+完成后得到：
+
+```
+dist/QQ群相册下载/
+  QQ群相册下载.exe   ← 双击运行
+  _internal/         ← 依赖（PySide6 / Chromium 等），不要删
+```
+
+说明：
+
+- 使用**目录模式**（不是单文件），内置浏览器（QtWebEngine）才能稳定工作。
+- 首次打包约数分钟，成品体积约 **200MB+**（含 Chromium）。
+- 发给别人时请压缩/拷贝整个 `QQ群相册下载` 文件夹，不要只拷 exe。
+- 目标电脑一般**不需要**再装 Python。
 
 ## 说明
 
